@@ -27,7 +27,8 @@ if platform in ('linux', 'darwin'):
             ),
         ], force=True, emit_linenums=False, quiet=True)
 
-    except ImportError:
+    except ImportError as e:
+        print(e)
         extensions = [
             Extension(
                 "aiofile.posix_aio",
