@@ -7,7 +7,7 @@ from libc.stdint cimport uint32_t
 from libc.string cimport memcpy
 from posix.fcntl cimport O_DSYNC
 from posix.signal cimport sigevent
-from posix.signal cimport sigval, SIGEV_THREAD, SIGEV_NONE
+from posix.signal cimport sigval, SIGEV_THREAD, SIGEV_SIGNAL, SIGEV_NONE
 from posix.types cimport off_t
 
 import asyncio
@@ -26,11 +26,11 @@ cdef extern from "<aio.h>" nogil:
     cdef struct aiocb:
         int             aio_fildes     # File descriptor
         off_t           aio_offset     # File offset
-        vvoid           *aio_buf       # Location of buffer
+        vvoid * aio_buf       # Location of buffer
         size_t          aio_nbytes     # Length of transfer
         int             aio_reqprio    # Request priority
         sigevent        aio_sigevent   # Notification method
-        int             aio_lio_opcode # Operation to be performed; lio_listio() only
+        int             aio_lio_opcode  # Operation to be performed; lio_listio() only
 
         # Various implementation-internal fields not shown
 
@@ -39,12 +39,12 @@ cdef extern from "<aio.h>" nogil:
         LIO_WRITE,
         LIO_NOP
 
-    cdef int aio_read(aiocb *aiocbp)
-    cdef int aio_write(aiocb *aiocbp)
-    cdef int aio_fsync(int op, aiocb *aiocbp)
-    cdef int aio_error(const aiocb *aiocbp)
-    cdef ssize_t aio_return(aiocb *aiocbp)
-    cdef int aio_cancel(int fd, aiocb *aiocbp)
+    cdef int aio_read(aiocb * aiocbp)
+    cdef int aio_write(aiocb * aiocbp)
+    cdef int aio_fsync(int op, aiocb * aiocbp)
+    cdef int aio_error(const aiocb * aiocbp)
+    cdef ssize_t aio_return(aiocb * aiocbp)
+    cdef int aio_cancel(int fd, aiocb * aiocbp)
     # cdef int aio_suspend(const aiocb * const aiocb_list[], int nitems, const timespec *timeout)
     # cdef int lio_listio(int mode, aiocb *const aiocb_list[], int nitems, sigevent *sevp)
 
@@ -59,7 +59,7 @@ cpdef object log = logging.getLogger("aio")
 
 cdef int get_supported_notify_method():
     if platform.system() == 'Darwin':
-        return SIGEV_NONE
+        return SIGEV_SIGNAL
     elif platform.system() == 'Linux':
         return SIGEV_THREAD
     else:
@@ -76,17 +76,16 @@ cdef enum:
     AIO_OP_CLOSED,
 
 
-ctypedef void (*result_cb)()
+ctypedef void(*result_cb)()
 
 
 cdef void on_event(sigval sv) with gil:
-    cdef unsigned long long* val = <unsigned long long*>sv.sival_ptr
+    cdef unsigned long long * val = <unsigned long long * >sv.sival_ptr
 
     op = OP_MAP.pop(val[0], None)
 
     if op:
         op._set_result()
-
 
 
 cdef dict AIO_READ_ERRORS = {
@@ -168,8 +167,8 @@ else:
 
 
 cdef class AIOOperation:
-    cdef aiocb* cb
-    cdef char* __buffer
+    cdef aiocb * cb
+    cdef char * __buffer
     cdef int size
     cdef int __state
     cdef unsigned long long cid
@@ -191,10 +190,10 @@ cdef class AIOOperation:
             self.__state = AIO_OP_INIT
             self.size = 0
 
-            self.__buffer = <char*>calloc(nbytes + 1, sizeof(char))
+            self.__buffer = <char * >calloc(nbytes + 1, sizeof(char))
 
-            self.cb = <aiocb*>calloc(1, sizeof(aiocb))
-            self.cb.aio_buf = <vvoid*> self.__buffer
+            self.cb = <aiocb * >calloc(1, sizeof(aiocb))
+            self.cb.aio_buf = <vvoid * > self.__buffer
 
             self.cb.aio_fildes = fd
             self.cb.aio_offset = offset
@@ -203,9 +202,9 @@ cdef class AIOOperation:
             self.cb.aio_lio_opcode = opcode
             self.cb.aio_sigevent.sigev_notify = SIGEV_TYPE
 
-        if SIGEV_TYPE == SIGEV_THREAD:
+        if SIGEV_TYPE != SIGEV_NONE:
             self.cb.aio_sigevent.sigev_notify_function = on_event
-            self.cb.aio_sigevent.sigev_value.sival_ptr = <void*>&self.cid
+            self.cb.aio_sigevent.sigev_value.sival_ptr = <void * > & self.cid
             OP_MAP[self.cid] = self
 
     @property
@@ -228,7 +227,7 @@ cdef class AIOOperation:
         if data_len > self.cb.aio_nbytes:
             raise ValueError("Data too long")
 
-        cdef char* cdata = <char*> data
+        cdef char * cdata = <char * > data
 
         with nogil:
             memcpy(self.__buffer, cdata, data_len)
@@ -340,7 +339,7 @@ cdef class AIOOperation:
                         raise
 
             # Awaiting callback when SIGEV_THREAD  (Linux)
-            if self.cb.aio_sigevent.sigev_notify == SIGEV_THREAD:
+            if self.cb.aio_sigevent.sigev_notify != SIGEV_THREAD:
                 yield from _run_coro(self.event.wait())
 
                 with nogil:
@@ -352,23 +351,6 @@ cdef class AIOOperation:
                         errorcode[result],
                         os.strerror(result)
                     )
-
-            # Polling aio_error when SIGEV_NONE (Mac OS X)
-            elif self.cb.aio_sigevent.sigev_notify == SIGEV_NONE:
-                while True:
-                    with nogil:
-                        result = aio_error(self.cb)
-                        error = errno
-
-                    if result == 0:
-                        break
-                    elif result == -1:
-                        raise SystemError(
-                            errorcode[error],
-                            os.strerror(error)
-                        )
-                    else:
-                        yield
 
             self.__state = AIO_OP_DONE
 
